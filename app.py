@@ -156,13 +156,13 @@ st.markdown(
         </div>
         <div class="privacy-item">
           <strong>✅ Read-only, encrypted connection</strong>
-          <span>The app connects to your email over an encrypted SSL connection.
+          <span>The app connects to your Gmail over an encrypted OAuth connection.
           It can only read emails — it cannot send, delete, or modify anything.</span>
         </div>
         <div class="privacy-item">
-          <strong>✅ You stay in control</strong>
-          <span>Use an app password (not your real password). Revoke it from
-          your email provider's settings at any time — without changing your main password.</span>
+          <strong>✅ All processing happens on the server — no third-party AI</strong>
+          <span>Flight data is extracted locally using pattern recognition.
+          Your email content is never sent to any external AI service or third party.</span>
         </div>
       </div>
     </div>
@@ -313,8 +313,8 @@ def render_scan_step():
     st.info(
         f"Will search **{country['lookback_years']} years** of Gmail for flights "
         f"involving **{country.get('flag','')} {country['name']}**. "
-        f"Email text is read by Claude AI to extract flight details — "
-        f"no emails are stored by this app.",
+        f"Flight details are extracted locally using pattern recognition — "
+        f"no email content leaves this server.",
         icon="⏱️",
     )
 
