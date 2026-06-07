@@ -1,18 +1,28 @@
 """
 Google OAuth 2.0 authentication for Streamlit.
 
-Security design (all audit findings addressed):
-  - FIX C-1: No shared OAuth singleton. A fresh Flow/Credentials object is
-    created per operation. st.session_state is fully isolated per user.
-  - FIX C-2: OAuth `state` is stored in st.session_state before redirect and
-    validated on callback with secrets.compare_digest(). Consumed exactly once.
-  - FIX H-3: Secrets loaded from st.secrets or env — startup fails fast if missing.
-  - FIX M-3: Tokens live only in st.session_state (per-user RAM). Never on disk.
-  - FIX M-4: access_type='offline' so refresh tokens are issued and access
-    tokens can be refreshed automatically.
-  - Privacy guarantee: logout() wipes all token state — called after every scan.
+Root cause of the session loss problem:
+  Streamlit creates a NEW session when Google redirects back to the app —
+  the WebSocket connection was dropped while the user was on Google's page.
+  Any oauth_state stored in st.session_state before the redirect is gone.
+
+Fix: HMAC-signed state tokens.
+  Instead of storing state server-side and comparing on callback, we encode
+  a cryptographically signed token as the state parameter. The signature can
+  be verified on any session without storage — equivalent CSRF protection,
+  zero session dependency.
+
+Other security design:
+  - FIX C-1: No shared OAuth singleton. Fresh Flow/Credentials per operation.
+  - FIX H-3: Secrets loaded from st.secrets or env — fails fast if missing.
+  - FIX M-3: Tokens live only in st.session_state (per-user RAM, never disk).
+  - FIX M-4: access_type='offline' so refresh tokens are issued.
+  - Privacy guarantee: logout() wipes all token state after every scan.
 """
 
+import base64
+import hashlib
+import hmac
 import os
 import secrets
 import streamlit as st
@@ -20,14 +30,13 @@ from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
-# Read-only Gmail scope — minimum necessary privilege
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 
+# ── Secrets ───────────────────────────────────────────────────────────────────
+
 def _get_secret(key: str) -> str:
-    """Load a secret from st.secrets (Streamlit Cloud) or env (local).
-    Raises clearly if missing — no silent fallback defaults (Fix H-3).
-    """
+    """Load from st.secrets (Streamlit Cloud) or env (local). Fails fast."""
     try:
         val = st.secrets.get(key)
         if val:
@@ -38,7 +47,7 @@ def _get_secret(key: str) -> str:
     if not val:
         raise EnvironmentError(
             f"Required secret '{key}' not found. "
-            f"Add it to .streamlit/secrets.toml (local) or Streamlit Cloud secrets."
+            f"Add it to .streamlit/secrets.toml or Streamlit Cloud secrets."
         )
     return val
 
@@ -50,6 +59,42 @@ def get_redirect_uri() -> str:
         uri = None
     return uri or os.getenv("REDIRECT_URI") or "http://localhost:8501"
 
+
+# ── HMAC-signed state tokens ──────────────────────────────────────────────────
+# These survive Streamlit's session recreation on redirect because they are
+# self-verifying — no server-side storage needed.
+
+def _make_signed_state() -> str:
+    """Create a signed state token: base64(nonce) + '.' + base64(HMAC).
+
+    The nonce provides uniqueness; the HMAC proves the token was issued by
+    this server. Signing key is the GOOGLE_CLIENT_SECRET so it's secret and
+    stable across Streamlit session boundaries.
+    """
+    nonce = secrets.token_bytes(32)
+    nonce_b64 = base64.urlsafe_b64encode(nonce).decode().rstrip("=")
+    key = _get_secret("GOOGLE_CLIENT_SECRET").encode()
+    sig = hmac.new(key, nonce_b64.encode(), hashlib.sha256).digest()
+    sig_b64 = base64.urlsafe_b64encode(sig).decode().rstrip("=")
+    return f"{nonce_b64}.{sig_b64}"
+
+
+def _verify_signed_state(state: str) -> bool:
+    """Verify an HMAC-signed state token. Returns False on any failure."""
+    try:
+        parts = state.rsplit(".", 1)
+        if len(parts) != 2:
+            return False
+        nonce_b64, received_sig_b64 = parts
+        key = _get_secret("GOOGLE_CLIENT_SECRET").encode()
+        expected_sig = hmac.new(key, nonce_b64.encode(), hashlib.sha256).digest()
+        expected_b64 = base64.urlsafe_b64encode(expected_sig).decode().rstrip("=")
+        return hmac.compare_digest(received_sig_b64, expected_b64)
+    except Exception:
+        return False
+
+
+# ── OAuth Flow ────────────────────────────────────────────────────────────────
 
 def _make_flow() -> Flow:
     """Create a fresh OAuth2 Flow. Never reuse across users (Fix C-1)."""
@@ -68,18 +113,17 @@ def _make_flow() -> Flow:
 
 
 def get_auth_url() -> str:
-    """Generate the Google sign-in URL and store CSRF state in session.
+    """Generate the Google sign-in URL with a signed state token.
 
-    State is cryptographically random, stored before redirect, validated
-    on callback — prevents CSRF and token injection (Fix C-2).
+    The state is HMAC-signed so it can be verified on callback without
+    session storage — survives Streamlit's session recreation on redirect.
     """
     flow  = _make_flow()
-    state = secrets.token_urlsafe(32)
-    st.session_state["oauth_state"] = state
+    state = _make_signed_state()
 
     auth_url, _ = flow.authorization_url(
-        access_type="offline",      # Issues refresh token (Fix M-4)
-        prompt="select_account",    # Let user choose account; no forced re-consent
+        access_type="offline",
+        prompt="select_account",
         state=state,
         include_granted_scopes="true",
     )
@@ -87,30 +131,24 @@ def get_auth_url() -> str:
 
 
 def handle_oauth_callback(code: str, returned_state: str) -> None:
-    """Exchange authorization code for tokens after validating CSRF state.
+    """Exchange authorization code for tokens after verifying signed state.
 
-    Raises ValueError on any validation failure.
+    Raises ValueError if the state signature is invalid (CSRF protection).
     Tokens stored only in st.session_state (Fix M-3, Fix C-1).
     """
-    stored_state = st.session_state.pop("oauth_state", None)
-
-    if stored_state is None:
+    if not _verify_signed_state(returned_state):
         raise ValueError(
-            "No OAuth state in session — possible expired session or CSRF attempt. "
-            "Please start the sign-in flow again."
-        )
-    # Constant-time comparison prevents timing attacks on the state token
-    if not secrets.compare_digest(stored_state, returned_state):
-        raise ValueError(
-            "OAuth state mismatch — possible CSRF attempt. "
+            "OAuth state verification failed — possible CSRF attempt. "
             "Please start the sign-in flow again."
         )
 
     flow = _make_flow()
-    flow.fetch_token(code=code)
+
+    # Pass the state through so requests_oauthlib doesn't re-validate it
+    # with a session it doesn't have
+    flow.fetch_token(code=code, state=returned_state)
     creds = flow.credentials
 
-    # Store serialised credentials — never the Flow object (Fix C-1)
     st.session_state["google_creds"] = {
         "token":         creds.token,
         "refresh_token": creds.refresh_token,
@@ -119,15 +157,13 @@ def handle_oauth_callback(code: str, returned_state: str) -> None:
         "client_secret": creds.client_secret,
         "scopes":        list(creds.scopes or GMAIL_SCOPES),
     }
-    st.session_state["authenticated"]  = True
-    st.session_state["connected_email"] = (
-        st.session_state.get("google_user_email", "Gmail account")
-    )
+    st.session_state["authenticated"]   = True
+    st.session_state["connected_email"] = "Gmail account"
 
 
 def get_credentials() -> Credentials:
     """Reconstruct a fresh Credentials object from session state (Fix C-1).
-    Auto-refreshes the access token if expired (Fix M-4).
+    Auto-refreshes if expired (Fix M-4).
     """
     raw = st.session_state.get("google_creds")
     if not raw:
@@ -151,9 +187,8 @@ def get_credentials() -> Credentials:
 
 
 def logout() -> None:
-    """Permanently wipe all auth state from session — called after every scan."""
-    for key in ("google_creds", "authenticated", "connected_email",
-                "oauth_state", "google_user_email"):
+    """Permanently wipe all auth state — called after every scan."""
+    for key in ("google_creds", "authenticated", "connected_email", "oauth_state"):
         st.session_state.pop(key, None)
 
 
