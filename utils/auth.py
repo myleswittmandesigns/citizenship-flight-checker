@@ -1,167 +1,158 @@
 """
-Gmail OAuth 2.0 handling for Streamlit.
+IMAP authentication and connection management.
 
-Security design decisions vs. prior Express version:
-  - FIX C-1: No shared OAuth singleton. A fresh Flow/Credentials object is
-    created per operation. Streamlit session_state is per-user and isolated.
-  - FIX C-2: OAuth `state` is stored in session_state before redirect and
-    validated on callback. Mismatches raise immediately and consume the state.
-  - FIX H-3: Secrets loaded from st.secrets (Streamlit Cloud) or .env
-    (local), never from a fallback default.
-  - FIX M-3: Tokens live only in st.session_state (per-user RAM). Never
-    written to disk or a shared store.
-  - FIX M-4: access_type='offline' requested so refresh tokens are issued.
-    Credentials object handles refresh automatically.
+Security design:
+  - SSL/TLS enforced on every connection (port 993) — plaintext never attempted.
+  - App password (not main password) is the expected credential.
+  - Credentials stored only in st.session_state (per-user RAM, not disk).
+  - IMAP connection is opened, used, and closed per-scan — not kept alive.
+  - Connection timeout prevents hanging on bad server responses.
+  - Credentials cleared on logout.
 """
 
-import os
-import secrets
+import imaplib
+import socket
 import streamlit as st
-from google_auth_oauthlib.flow import Flow
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
 
-# Read-only Gmail scope — minimum necessary privilege
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+# ── Provider presets ──────────────────────────────────────────────────────────
+# Each entry: IMAP host, port, folders to search, and app-password guidance.
+PROVIDERS: dict[str, dict] = {
+    "Gmail": {
+        "host": "imap.gmail.com",
+        "port": 993,
+        "folders": ["INBOX", "[Gmail]/Sent Mail"],
+        "app_password_url": "https://myaccount.google.com/apppasswords",
+        "app_password_steps": (
+            "1. Go to your Google Account → **Security**\n"
+            "2. Under 'How you sign in to Google', select **2-Step Verification** "
+            "(must be enabled first)\n"
+            "3. At the bottom of that page, select **App passwords**\n"
+            "4. Choose app: *Mail* — Choose device: *Other* — click **Generate**\n"
+            "5. Copy the 16-character password shown"
+        ),
+    },
+    "Outlook / Hotmail / Live": {
+        "host": "outlook.office365.com",
+        "port": 993,
+        "folders": ["INBOX", "Sent"],
+        "app_password_url": "https://account.microsoft.com/security",
+        "app_password_steps": (
+            "1. Go to **account.microsoft.com/security**\n"
+            "2. Select **Advanced security options**\n"
+            "3. Under 'App passwords', select **Create a new app password**\n"
+            "4. Copy the generated password\n\n"
+            "*(Requires Microsoft 2-step verification to be enabled)*"
+        ),
+    },
+    "Yahoo Mail": {
+        "host": "imap.mail.yahoo.com",
+        "port": 993,
+        "folders": ["INBOX", "Sent"],
+        "app_password_url": "https://myaccount.yahoo.com/security",
+        "app_password_steps": (
+            "1. Go to **myaccount.yahoo.com/security**\n"
+            "2. Select **Generate app password**\n"
+            "3. Choose *Other app* from the dropdown\n"
+            "4. Enter a name (e.g. 'FlightChecker') and click **Generate**\n"
+            "5. Copy the password shown"
+        ),
+    },
+    "iCloud / Apple Mail": {
+        "host": "imap.mail.me.com",
+        "port": 993,
+        "folders": ["INBOX", "Sent Messages"],
+        "app_password_url": "https://appleid.apple.com",
+        "app_password_steps": (
+            "1. Go to **appleid.apple.com** and sign in\n"
+            "2. Select **Sign-In and Security → App-Specific Passwords**\n"
+            "3. Click **Generate an app-specific password**\n"
+            "4. Enter a label (e.g. 'FlightChecker') and click **Create**\n"
+            "5. Copy the password shown\n\n"
+            "*(Requires Apple ID two-factor authentication to be enabled)*"
+        ),
+    },
+    "Other (custom IMAP)": {
+        "host": "",
+        "port": 993,
+        "folders": ["INBOX"],
+        "app_password_url": None,
+        "app_password_steps": (
+            "Check your email provider's help pages for:\n"
+            "- IMAP server address\n"
+            "- Whether they support app passwords or require your regular password"
+        ),
+    },
+}
 
 
-def _get_secret(key: str) -> str:
-    """Load a secret from st.secrets (Streamlit Cloud) or env (local dev).
-    Raises clearly if not found — no silent fallback defaults.
+def connect(host: str, port: int, email_address: str, app_password: str) -> imaplib.IMAP4_SSL:
+    """Open an SSL IMAP connection and authenticate. Returns the connection object.
+
+    Raises:
+        imaplib.IMAP4.error  — bad credentials
+        socket.timeout       — server unreachable / timed out
+        ConnectionRefusedError — port blocked or wrong host
+        OSError              — network-level failure
     """
-    # st.secrets is available in both Cloud and local .streamlit/secrets.toml
+    # 30-second socket timeout prevents indefinite hangs
+    imap = imaplib.IMAP4_SSL(host=host, port=port)
+    imap.socket().settimeout(30)
+    imap.login(email_address, app_password)
+    return imap
+
+
+def test_connection(host: str, port: int, email_address: str, app_password: str) -> tuple[bool, str]:
+    """Attempt a connection and return (success, message).
+
+    Used by the UI to validate credentials before starting a full scan.
+    Connection is closed immediately after the test.
+    """
     try:
-        val = st.secrets.get(key)
-        if val:
-            return val
-    except Exception:
-        pass
-    val = os.getenv(key)
-    if not val:
-        raise EnvironmentError(
-            f"Required secret '{key}' not found in st.secrets or environment. "
-            f"Copy .env.example to .env and fill in your credentials."
-        )
-    return val
+        imap = connect(host, port, email_address, app_password)
+        imap.logout()
+        return True, "Connected successfully."
+    except imaplib.IMAP4.error as exc:
+        msg = str(exc).lower()
+        if "invalid credentials" in msg or "authentication failed" in msg:
+            return False, (
+                "Incorrect email or app password. "
+                "Make sure you're using an **app password**, not your regular login password."
+            )
+        return False, f"IMAP error: {exc}"
+    except (socket.timeout, TimeoutError):
+        return False, "Connection timed out. Check that IMAP is enabled for your account."
+    except ConnectionRefusedError:
+        return False, f"Connection refused on {host}:{port}. Verify the server settings."
+    except OSError as exc:
+        return False, f"Network error: {exc}"
 
 
-def _get_redirect_uri() -> str:
-    try:
-        uri = st.secrets.get("REDIRECT_URI") or os.getenv("REDIRECT_URI")
-    except Exception:
-        uri = os.getenv("REDIRECT_URI")
-    return uri or "http://localhost:8501"
-
-
-def _make_flow() -> Flow:
-    """Create a fresh OAuth flow. Never reuse across users or requests."""
-    client_config = {
-        "web": {
-            "client_id": _get_secret("GOOGLE_CLIENT_ID"),
-            "client_secret": _get_secret("GOOGLE_CLIENT_SECRET"),
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-        }
-    }
-    return Flow.from_client_config(
-        client_config,
-        scopes=GMAIL_SCOPES,
-        redirect_uri=_get_redirect_uri(),
-    )
-
-
-def get_auth_url() -> str:
-    """Generate OAuth authorization URL and save CSRF state to session.
-
-    The state value is cryptographically random and consumed exactly once
-    on callback — preventing CSRF and replay attacks (Fix C-2).
-    """
-    flow = _make_flow()
-    state = secrets.token_urlsafe(32)
-    st.session_state["oauth_state"] = state
-
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",    # Issues refresh token (Fix M-4)
-        prompt="select_account",  # No forced re-consent on every login (Fix L-1)
-        state=state,
-        include_granted_scopes="true",
-    )
-    return auth_url
-
-
-def handle_oauth_callback(code: str, returned_state: str) -> None:
-    """Exchange authorization code for tokens after validating CSRF state.
-
-    Raises ValueError on state mismatch — caller should surface this to user.
-    Tokens are stored only in st.session_state (Fix M-3, Fix C-1).
-    """
-    stored_state = st.session_state.pop("oauth_state", None)
-
-    if stored_state is None:
-        raise ValueError(
-            "No OAuth state found in session. "
-            "This may indicate a CSRF attempt or an expired session."
-        )
-    if not secrets.compare_digest(stored_state, returned_state):
-        raise ValueError(
-            "OAuth state mismatch — possible CSRF attack. "
-            "Please start the login flow again."
-        )
-
-    flow = _make_flow()
-    # Exchange the authorization code for tokens
-    flow.fetch_token(code=code)
-    creds = flow.credentials
-
-    # Store serialized credentials — never the Flow object (Fix C-1)
-    st.session_state["gmail_creds"] = {
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": list(creds.scopes or GMAIL_SCOPES),
+def save_credentials(email_address: str, app_password: str, host: str, port: int, folders: list[str]) -> None:
+    """Store IMAP credentials in session state only — never written to disk."""
+    st.session_state["imap_creds"] = {
+        "email":    email_address,
+        "password": app_password,   # app password, not main password
+        "host":     host,
+        "port":     port,
+        "folders":  folders,
     }
     st.session_state["authenticated"] = True
-    st.session_state["connected_at"] = str(
-        __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    )
+    st.session_state["connected_email"] = email_address
 
 
-def get_credentials() -> Credentials:
-    """Reconstruct a fresh Credentials object from session state.
-
-    This is per-call (Fix C-1 — no shared singleton).
-    Automatically refreshes the access token if expired (Fix M-4).
-    """
-    raw = st.session_state.get("gmail_creds")
-    if not raw:
-        raise RuntimeError("Not authenticated. Please connect Gmail first.")
-
-    creds = Credentials(
-        token=raw["token"],
-        refresh_token=raw.get("refresh_token"),
-        token_uri=raw["token_uri"],
-        client_id=raw["client_id"],
-        client_secret=raw["client_secret"],
-        scopes=raw["scopes"],
-    )
-
-    # Refresh if expired — updates token in place
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        # Persist refreshed token back to session
-        raw["token"] = creds.token
-        st.session_state["gmail_creds"] = raw
-
+def get_credentials() -> dict:
+    """Retrieve stored IMAP credentials from session state."""
+    creds = st.session_state.get("imap_creds")
+    if not creds:
+        raise RuntimeError("Not authenticated. Please connect your email first.")
     return creds
 
 
 def logout() -> None:
-    """Clear all auth-related state from the session."""
-    for key in ("gmail_creds", "authenticated", "connected_at", "oauth_state"):
+    """Clear all auth-related state."""
+    for key in ("imap_creds", "authenticated", "connected_email"):
         st.session_state.pop(key, None)
 
 
 def is_authenticated() -> bool:
-    return bool(st.session_state.get("authenticated") and st.session_state.get("gmail_creds"))
+    return bool(st.session_state.get("authenticated") and st.session_state.get("imap_creds"))
