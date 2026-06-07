@@ -5,11 +5,21 @@ Sends email text to Anthropic's API and returns structured flight records.
 Email content is NOT stored by this application — it is sent to Anthropic
 for processing. Users are informed of this in the UI before scanning.
 
+Passenger vs. visitor filtering
+────────────────────────────────
+Claude is instructed to determine whether the email recipient is one of the
+passengers on the flights found — or whether a third party (visiting friend,
+colleague sharing plans, etc.) is the actual traveler. Only "recipient is
+passenger" emails contribute flights to the results.
+
+An optional passenger_name hint makes this classification more accurate when
+names appear on the booking confirmation.
+
 Security notes:
   - Email body is truncated before transmission (reduce data exposure surface).
   - Claude response is parsed with strict JSON validation; malformed responses
     return [] rather than crashing.
-  - Timeout enforced per API call (Fix M-2 analog).
+  - Timeout enforced per API call.
 """
 
 import json
@@ -19,44 +29,93 @@ import streamlit as st
 import anthropic
 
 # Max characters of email body sent to Claude — balances completeness vs exposure
-_MAX_EMAIL_CHARS = 5_000
+_MAX_EMAIL_CHARS = 6_000
 
 _EXTRACTION_PROMPT = """\
-You are a precise flight data extractor. Extract all flight booking information \
-from the email below.
+You are processing emails for a citizenship/residency application tool that \
+compiles the user's personal international flight history.
 
-Return ONLY a valid JSON object with a "flights" array. \
-Each flight object must have exactly these fields:
-- airline: string (full airline name, e.g. "United Airlines")
-- flight_number: string (e.g. "UA 123") or null
-- departure_airport: string (IATA code if available, e.g. "JFK") or null
-- departure_city: string or null
-- departure_country: string (2-letter ISO country code, e.g. "US") or null
-- arrival_airport: string (IATA code if available) or null
-- arrival_city: string or null
-- arrival_country: string (2-letter ISO country code) or null
-- departure_date: string (YYYY-MM-DD) or null
-- arrival_date: string (YYYY-MM-DD) or null
-- booking_reference: string (PNR/confirmation code) or null
+────────────────────────────────────────────────────────────
+STEP 1 — Decide whether this email belongs to the user
+────────────────────────────────────────────────────────────
+Set "recipient_is_passenger" to TRUE if this email is a flight booking or \
+confirmation where the INBOX OWNER (the email recipient) is one of the \
+passengers. This includes:
 
-Rules:
-- Include ONLY actual flight segments (not hotels, cars, or train bookings)
-- If multiple legs exist (round-trip or connections) include each as a separate object
-- If the email is NOT a flight booking/confirmation, return {{"flights": []}}
-- Return ONLY valid JSON — no explanation text, no markdown
+  • Booking confirmations sent directly from an airline or OTA to the user
+  • Check-in reminders, boarding pass emails, e-ticket receipts
+  • Forwarded booking confirmations where the inbox owner IS the listed \
+passenger (e.g. a colleague or employer booked a ticket on their behalf)
+  • Corporate travel tool confirmations (Concur, Navan, Egencia, etc.)
+  • Round-trip or multi-leg itineraries where the user is on all segments
 
-Email metadata:
+Set "recipient_is_passenger" to FALSE — and return an empty flights array — if:
+
+  • A friend, family member, or colleague is sharing THEIR OWN travel plans to \
+visit the inbox owner ("Here's my flight so you can pick me up", "I'll be \
+arriving on Friday", "my itinerary for coming to see you")
+  • The email is clearly about someone else traveling TO the user, not the user \
+traveling themselves
+  • The email is a hotel-only, car-only, train-only, or cruise booking with no \
+flights
+  • The email is a flight deal alert, newsletter, or advertisement (no actual \
+booking)
+
+IMPORTANT — forwarded emails:
+  • "Fwd:" in the subject does NOT automatically mean exclude. Check the \
+passenger name. If the forwarded confirmation shows the inbox owner as \
+passenger, include it. If it shows the forwarder as passenger traveling to \
+visit, exclude it.
+
+{name_hint}\
+
+────────────────────────────────────────────────────────────
+STEP 2 — Extract flight segments
+────────────────────────────────────────────────────────────
+If recipient_is_passenger is TRUE, extract every individual flight segment \
+(include each leg of a connection or round-trip as its own object).
+
+Return ONLY a valid JSON object — no markdown, no explanation:
+
+{{
+  "recipient_is_passenger": true,
+  "flights": [
+    {{
+      "airline": "Full airline name, e.g. United Airlines",
+      "flight_number": "e.g. UA 123 — or null",
+      "departure_airport": "IATA code e.g. JFK — or null",
+      "departure_city": "City name — or null",
+      "departure_country": "2-letter ISO code e.g. US — or null",
+      "arrival_airport": "IATA code — or null",
+      "arrival_city": "City name — or null",
+      "arrival_country": "2-letter ISO code — or null",
+      "departure_date": "YYYY-MM-DD — or null",
+      "arrival_date": "YYYY-MM-DD — or null",
+      "booking_reference": "PNR/confirmation code — or null"
+    }}
+  ]
+}}
+
+If recipient_is_passenger is FALSE:
+{{
+  "recipient_is_passenger": false,
+  "flights": []
+}}
+
+────────────────────────────────────────────────────────────
+EMAIL
+────────────────────────────────────────────────────────────
 Subject: {subject}
 From: {sender}
 Date: {date}
 
-Email content (may be truncated):
+Body:
 {body}
 """
 
 
 def _get_client() -> anthropic.Anthropic:
-    """Create a fresh Anthropic client. Uses st.secrets or env (Fix H-3 pattern)."""
+    """Create a fresh Anthropic client. Uses st.secrets or env."""
     try:
         api_key = st.secrets.get("ANTHROPIC_API_KEY")
     except Exception:
@@ -67,25 +126,50 @@ def _get_client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=api_key)
 
 
-def extract_flights(email_text: str, subject: str, sender: str, date: str) -> list[dict]:
+def extract_flights(
+    body: str,
+    subject: str,
+    sender: str,
+    date: str,
+    passenger_name: str = "",
+) -> list[dict]:
     """Extract flight records from a single email using Claude.
 
-    Returns a list of flight dicts (may be empty). Never raises — on any
-    error it logs and returns [].
+    Returns a list of flight dicts for the email recipient's own flights.
+    Returns [] if the email is for a visitor, not a booking, or on any error.
 
     Args:
-        email_text: Plain-text email body (HTML should be stripped by caller).
-        subject:    Email subject header.
-        sender:     Email From header.
-        date:       Email Date header.
+        body:           Plain-text email body (HTML stripped by caller).
+        subject:        Email Subject header.
+        sender:         Email From header.
+        date:           Email Date header.
+        passenger_name: Optional. User's full name — helps Claude match
+                        passenger fields and filter visitor emails.
     """
-    if not email_text or len(email_text.strip()) < 30:
+    if not body or len(body.strip()) < 30:
         return []
 
+    # Build name hint for the prompt
+    if passenger_name and passenger_name.strip():
+        name_hint = (
+            f"The inbox owner's name is: {passenger_name.strip()!r}\n"
+            "Use this to help determine if the listed passenger is the inbox "
+            "owner. If the name does not appear in the email, use other signals "
+            "(booking language, email address, pronoun context) to decide.\n\n"
+        )
+    else:
+        name_hint = (
+            "No name was provided for the inbox owner. Use context clues — "
+            "booking confirmation language, 'your itinerary', 'you are booked', "
+            "direct airline/OTA sender, etc. — to decide if this is the "
+            "recipient's own flight.\n\n"
+        )
+
     # Truncate before transmission — reduce data exposure surface
-    truncated_body = email_text[:_MAX_EMAIL_CHARS]
+    truncated_body = body[:_MAX_EMAIL_CHARS]
 
     prompt = _EXTRACTION_PROMPT.format(
+        name_hint=name_hint,
         subject=subject[:200],
         sender=sender[:200],
         date=date[:100],
@@ -97,27 +181,30 @@ def extract_flights(email_text: str, subject: str, sender: str, date: str) -> li
         response = client.messages.create(
             model="claude-opus-4-5",
             max_tokens=1024,
-            timeout=30.0,   # Hard per-call timeout (Fix M-2 analog)
+            timeout=30.0,
             messages=[{"role": "user", "content": prompt}],
         )
 
         raw_text = response.content[0].text.strip()
 
-        # Extract JSON even if surrounded by explanation text
+        # Extract JSON even if surrounded by stray text
         json_match = re.search(r"\{[\s\S]*\}", raw_text)
         if not json_match:
             return []
 
         parsed = json.loads(json_match.group())
-        flights = parsed.get("flights", [])
 
+        # Respect Claude's passenger determination
+        if not parsed.get("recipient_is_passenger", True):
+            return []
+
+        flights = parsed.get("flights", [])
         if not isinstance(flights, list):
             return []
 
         return [_sanitize_flight(f) for f in flights if isinstance(f, dict)]
 
     except (anthropic.APITimeoutError, anthropic.RateLimitError) as exc:
-        # Surface rate/timeout issues as a warning but don't crash
         print(f"[extractor] API issue for '{subject[:50]}': {exc}")
         return []
     except (json.JSONDecodeError, KeyError, IndexError) as exc:
@@ -128,23 +215,21 @@ def extract_flights(email_text: str, subject: str, sender: str, date: str) -> li
         return []
 
 
+# ── Field sanitisation ────────────────────────────────────────────────────────
+
 _ISO_CODE_PATTERN = re.compile(r"^[A-Z]{2}$")
-_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_IATA_PATTERN = re.compile(r"^[A-Z]{3}$")
+_DATE_PATTERN     = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_IATA_PATTERN     = re.compile(r"^[A-Z]{3}$")
 
 
 def _sanitize_flight(f: dict) -> dict:
-    """Sanitize a raw flight dict from Claude. Coerce types, strip control chars.
-
-    This prevents Claude-sourced data from causing downstream issues.
-    """
+    """Sanitize a raw flight dict from Claude. Coerce types, strip control chars."""
 
     def clean_str(v, max_len=200) -> str | None:
         if v is None:
             return None
         s = str(v).strip()
-        # Remove control characters (potential injection vectors)
-        s = re.sub(r"[\x00-\x1f\x7f]", "", s)
+        s = re.sub(r"[\x00-\x1f\x7f]", "", s)   # strip control chars
         return s[:max_len] if s else None
 
     def clean_iso(v) -> str | None:
@@ -163,7 +248,7 @@ def _sanitize_flight(f: dict) -> dict:
         s = clean_str(v, 3)
         if s and _IATA_PATTERN.match(s.upper()):
             return s.upper()
-        return clean_str(v, 10)  # Fall back to city name if not IATA
+        return clean_str(v, 100)   # fall back to city name if not IATA
 
     return {
         "airline":            clean_str(f.get("airline"), 100),

@@ -108,6 +108,7 @@ _DEFAULTS = {
     "google_creds":       None,
     "connected_email":    None,
     "selected_country":   None,
+    "passenger_name":     "",      # Optional — improves passenger vs. visitor filtering
     "flights":            None,
     "scan_stats":         {},
     "credentials_wiped":  False,   # True after scan clears credentials
@@ -210,6 +211,20 @@ def render_country_step():
             st.info(c["notes"], icon="ℹ️")
     else:
         st.session_state["selected_country"] = None
+
+    st.write("")
+    name = st.text_input(
+        "Your full name (as it appears on bookings)",
+        value=st.session_state.get("passenger_name", ""),
+        placeholder="e.g. Jane Smith",
+        help=(
+            "Optional but recommended. Used to distinguish your own flights "
+            "from travel plans that friends or colleagues may have forwarded "
+            "to you. Your name is sent to Claude AI as part of the email "
+            "analysis — it is not stored by this app."
+        ),
+    )
+    st.session_state["passenger_name"] = name.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,9 +345,10 @@ def _run_scan(country: dict):
             raise ValueError("Invalid lookback period in country configuration.")
 
         flights = scanner.scan_emails(
-            creds=creds,
+            credentials=creds,
             country_iso_code=validated["iso_code"],
             lookback_years=lookback,
+            passenger_name=st.session_state.get("passenger_name", ""),
             progress_callback=on_progress,
         )
         st.session_state["scan_error"] = None   # Clear any previous error
