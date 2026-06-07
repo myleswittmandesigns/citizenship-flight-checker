@@ -32,6 +32,7 @@ from datetime import datetime, timedelta
 from googleapiclient.discovery import build
 
 from utils.extractor import extract_flights
+from utils.clean import deduplicate_flights
 
 
 # ── Search queries ─────────────────────────────────────────────────────────────
@@ -299,19 +300,8 @@ def scan_emails(
         or f.get("arrival_country")   == country_iso_code
     ]
 
-    # ── Deduplicate ───────────────────────────────────────────────────────────
-    seen: set[str] = set()
-    unique: list[dict] = []
-    for f in relevant:
-        key = "|".join([
-            f.get("flight_number") or f.get("airline") or "",
-            f.get("departure_date") or "",
-            f.get("departure_airport") or f.get("departure_city") or "",
-            f.get("arrival_airport")   or f.get("arrival_city")   or "",
-        ])
-        if key not in seen:
-            seen.add(key)
-            unique.append(f)
-
-    unique.sort(key=lambda f: f.get("departure_date") or "9999-12-31")
-    return unique
+    # ── Deduplicate and merge ─────────────────────────────────────────────────
+    # Uses fingerprint-based union-find so that the same flight appearing in
+    # multiple emails (booking confirmation, check-in reminder, receipt, etc.)
+    # is collapsed into a single merged record with the most complete data.
+    return deduplicate_flights(relevant)
