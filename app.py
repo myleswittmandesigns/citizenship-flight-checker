@@ -111,6 +111,7 @@ _DEFAULTS = {
     "flights":            None,
     "scan_stats":         {},
     "credentials_wiped":  False,   # True after scan clears credentials
+    "scan_error":         None,    # Persists through rerun so the user sees it
     "oauth_state":        None,
 }
 for _k, _v in _DEFAULTS.items():
@@ -222,10 +223,10 @@ def render_email_step():
         st.markdown(
             """
             <div class="wiped-banner">
-            🔐 <strong>Your Google access has been permanently revoked by this app.</strong><br>
-            The sign-in token no longer exists anywhere in this application —
-            not in memory, not on disk, not in any log. Your scan is complete and
-            this app can no longer access your Gmail.
+            ✅ <strong>Scan complete — Gmail access permanently revoked.</strong><br>
+            Your sign-in token has been deleted from this app. It no longer exists
+            anywhere — not in memory, not on disk, not in any log. Results are
+            shown below. This app cannot access your Gmail again without a new sign-in.
             </div>
             """,
             unsafe_allow_html=True,
@@ -307,7 +308,7 @@ def render_scan_step():
 
 
 def _run_scan(country: dict):
-    progress_bar = st.progress(0, text="Connecting to email server…")
+    progress_bar = st.progress(0, text="Connecting to Gmail…")
     status_text  = st.empty()
 
     def on_progress(processed: int, total: int, message: str):
@@ -315,29 +316,30 @@ def _run_scan(country: dict):
         progress_bar.progress(pct, text=message)
         status_text.caption(f"{processed} / {total} emails analyzed")
 
-    scan_error   = None
-    flights      = []
+    flights = []
 
     try:
         creds = auth.get_credentials()
 
         validated = country_lib.get_country_by_iso(country["iso_code"])
         if not validated:
-            scan_error = f"Unknown country code: {country['iso_code']!r}"
-        else:
-            lookback = int(validated["lookback_years"])
-            if not (1 <= lookback <= 15):
-                scan_error = "Invalid lookback period in country configuration."
-            else:
-                flights = scanner.scan_emails(
-                    creds=creds,
-                    country_iso_code=validated["iso_code"],
-                    lookback_years=lookback,
-                    progress_callback=on_progress,
-                )
+            raise ValueError(f"Unknown country code: {country['iso_code']!r}")
+
+        lookback = int(validated["lookback_years"])
+        if not (1 <= lookback <= 15):
+            raise ValueError("Invalid lookback period in country configuration.")
+
+        flights = scanner.scan_emails(
+            creds=creds,
+            country_iso_code=validated["iso_code"],
+            lookback_years=lookback,
+            progress_callback=on_progress,
+        )
+        st.session_state["scan_error"] = None   # Clear any previous error
 
     except Exception as exc:
-        scan_error = str(exc)
+        # Store in session_state so it survives the rerun and stays visible
+        st.session_state["scan_error"] = str(exc)
 
     finally:
         # ── ALWAYS wipe credentials — success, failure, or exception ─────────
@@ -348,22 +350,33 @@ def _run_scan(country: dict):
     progress_bar.empty()
     status_text.empty()
 
-    if scan_error:
-        st.error(f"❌ Scan failed: {scan_error}")
-        st.info("Your email credentials have been deleted regardless of the error.", icon="🔐")
-        st.rerun()
-        return
-
+    # Always store flights (empty list on error) so results section renders
     st.session_state["flights"] = flights
-    st.rerun()
+    st.rerun()   # Single rerun — session_state carries both flights and any error
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESULTS
 # ─────────────────────────────────────────────────────────────────────────────
 def render_results():
-    flights = st.session_state.get("flights")
-    country = st.session_state.get("selected_country")
+    flights     = st.session_state.get("flights")
+    country     = st.session_state.get("selected_country")
+    scan_error  = st.session_state.get("scan_error")
+
+    # Show a persistent error even when no flights came back
+    if scan_error and st.session_state.get("credentials_wiped"):
+        st.divider()
+        st.error(f"❌ Scan failed: {scan_error}")
+        st.info(
+            "Your Gmail access was still permanently revoked — no credentials were retained.",
+            icon="🔐",
+        )
+        if st.button("🔄 Try again", use_container_width=True):
+            st.session_state["scan_error"]        = None
+            st.session_state["credentials_wiped"] = False
+            st.session_state["flights"]           = None
+            st.rerun()
+        return
 
     if flights is None or country is None:
         return
