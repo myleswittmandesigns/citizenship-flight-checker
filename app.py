@@ -18,6 +18,23 @@ from dotenv import load_dotenv
 
 from utils import auth, countries as country_lib, compliance as comp_lib, scanner
 
+# ── OAuth callback — must run before any rendering ────────────────────────────
+def _check_oauth_callback():
+    params = st.query_params
+    if "code" not in params or "state" not in params:
+        return
+    code  = params["code"]
+    state = params["state"]
+    st.query_params.clear()   # Remove code from URL immediately (Fix I-4)
+    try:
+        auth.handle_oauth_callback(code, state)
+    except ValueError as exc:
+        st.error(f"❌ Sign-in failed: {exc}")
+    except Exception as exc:
+        st.error(f"❌ Unexpected error during sign-in: {exc}")
+
+_check_oauth_callback()
+
 load_dotenv()
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -88,12 +105,13 @@ st.markdown(
 # ── Session state defaults ────────────────────────────────────────────────────
 _DEFAULTS = {
     "authenticated":      False,
-    "imap_creds":         None,
+    "google_creds":       None,
     "connected_email":    None,
     "selected_country":   None,
     "flights":            None,
     "scan_stats":         {},
     "credentials_wiped":  False,   # True after scan clears credentials
+    "oauth_state":        None,
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -197,114 +215,60 @@ def render_country_step():
 # STEP 2 — CONNECT EMAIL (IMAP)
 # ─────────────────────────────────────────────────────────────────────────────
 def render_email_step():
-    st.markdown('<p class="step-label">Step 2 — Connect Your Email</p>', unsafe_allow_html=True)
+    st.markdown('<p class="step-label">Step 2 — Connect Your Gmail</p>', unsafe_allow_html=True)
 
     # ── Post-scan: credentials already wiped ─────────────────────────────────
     if st.session_state.get("credentials_wiped"):
         st.markdown(
             """
             <div class="wiped-banner">
-            🔐 <strong>Your email credentials have been permanently deleted.</strong><br>
-            The app password you entered no longer exists anywhere in this application —
-            not in memory, not on disk, not in any log. Your scan is complete and your
-            email account is no longer accessible to this tool.
+            🔐 <strong>Your Google access has been permanently revoked by this app.</strong><br>
+            The sign-in token no longer exists anywhere in this application —
+            not in memory, not on disk, not in any log. Your scan is complete and
+            this app can no longer access your Gmail.
             </div>
             """,
             unsafe_allow_html=True,
         )
         return
 
-    # ── Already connected (pre-scan) ─────────────────────────────────────────
+    # ── Already signed in (pre-scan) ─────────────────────────────────────────
     if auth.is_authenticated():
-        email_display = st.session_state.get("connected_email", "")
-        st.success(f"✅ Connected as **{email_display}**", icon="🔒")
+        email_display = st.session_state.get("connected_email", "your Gmail account")
+        st.success(f"✅ Signed in as **{email_display}**", icon="🔒")
         st.info(
-            "⏳ **Your app password is held in memory only until your scan completes.**  \n"
-            "The moment the scan finishes — successfully or not — your password is "
-            "permanently deleted from this application. You will not need to enter it again "
-            "unless you choose to run another scan.",
+            "⏳ **Gmail access is held only until your scan completes.**  \n"
+            "The moment the scan finishes — successfully or not — your sign-in "
+            "token is permanently deleted from this application.",
             icon="🔐",
         )
         return
 
-    # ── Privacy promise — shown before entering any credentials ──────────────
+    # ── Sign-in prompt ────────────────────────────────────────────────────────
     st.markdown(
-        "**What happens to your app password:**\n\n"
-        "1. You enter it below\n"
-        "2. This app uses it to connect to your email provider — once\n"
-        "3. The scan runs\n"
-        "4. **Your password is permanently deleted the instant the scan ends**\n\n"
-        "It is never written to disk, never logged, never transmitted to anyone "
-        "other than your own email provider over an encrypted connection."
+        "**What Google access is granted:**\n\n"
+        "- ✅ Read flight confirmation emails — one time only\n"
+        "- 🚫 Cannot send, delete, or modify any email\n"
+        "- 🚫 Access token is deleted the instant your scan completes\n\n"
+        "You will see Google's standard permission screen "
+        "clearly showing the read-only scope before granting access."
     )
-    st.divider()
 
-    # ── Provider selector ────────────────────────────────────────────────────
-    provider_name = st.selectbox(
-        "Email provider",
-        options=list(auth.PROVIDERS.keys()),
-        index=0,
-    )
-    provider = auth.PROVIDERS[provider_name]
-
-    # ── App password instructions ─────────────────────────────────────────────
-    with st.expander(f"📋 How to get an app password for {provider_name}", expanded=True):
-        st.markdown(provider["app_password_steps"])
-        if provider.get("app_password_url"):
-            st.link_button(
-                f"Open {provider_name} security settings →",
-                url=provider["app_password_url"],
-            )
+    try:
+        auth_url = auth.get_auth_url()
+        st.link_button(
+            "Sign in with Google",
+            url=auth_url,
+            use_container_width=True,
+            type="primary",
+        )
+    except EnvironmentError as exc:
+        st.error(f"⚙️ Configuration error: {exc}")
         st.info(
-            "An **app password** is a special limited-access code your provider generates "
-            "for third-party apps. It is **not** your real password. You can revoke it "
-            "from your email provider's security settings at any time without changing "
-            "your main account password.",
+            "The app needs `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` to be configured. "
+            "See the README for setup instructions.",
             icon="ℹ️",
         )
-
-    # ── Credential inputs ────────────────────────────────────────────────────
-    email_addr = st.text_input(
-        "Email address",
-        placeholder="you@example.com",
-        autocomplete="email",
-    )
-
-    if provider_name == "Other (custom IMAP)":
-        col_host, col_port = st.columns([3, 1])
-        custom_host = col_host.text_input("IMAP server", placeholder="imap.yourprovider.com")
-        custom_port = col_port.number_input("Port", value=993, min_value=1, max_value=65535)
-        host    = custom_host
-        port    = int(custom_port)
-        folders = ["INBOX"]
-    else:
-        host    = provider["host"]
-        port    = provider["port"]
-        folders = provider["folders"]
-
-    app_password = st.text_input(
-        "App password  *(not your regular password)*",
-        type="password",
-        placeholder="xxxx xxxx xxxx xxxx",
-    )
-
-    if st.button("Connect Email", type="primary", use_container_width=True):
-        if not email_addr or not app_password:
-            st.error("Please enter both your email address and app password.")
-            return
-        if provider_name == "Other (custom IMAP)" and not host:
-            st.error("Please enter your IMAP server address.")
-            return
-
-        with st.spinner("Verifying connection…"):
-            ok, message = auth.test_connection(host, port, email_addr, app_password)
-
-        if ok:
-            auth.save_credentials(email_addr, app_password, host, port, folders)
-            st.success("✅ Connected. Your password will be deleted as soon as the scan completes.")
-            st.rerun()
-        else:
-            st.error(f"❌ {message}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -331,17 +295,11 @@ def render_scan_step():
         return
 
     st.info(
-        f"Will search **{country['lookback_years']} years** of email for flights "
-        f"involving **{country.get('flag','')} {country['name']}** "
-        f"using Claude AI to read confirmation emails.",
+        f"Will search **{country['lookback_years']} years** of Gmail for flights "
+        f"involving **{country.get('flag','')} {country['name']}**. "
+        f"Email text is read by Claude AI to extract flight details — "
+        f"no emails are stored by this app.",
         icon="⏱️",
-    )
-
-    # Privacy notice
-    st.caption(
-        "📋 Email text is sent to Anthropic's Claude API for flight extraction. "
-        "Emails are not stored by this app. "
-        "[Anthropic privacy policy](https://www.anthropic.com/privacy)"
     )
 
     if st.button("✈️ Start Email Scan", type="primary", use_container_width=True):
