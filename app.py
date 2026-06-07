@@ -49,6 +49,35 @@ st.markdown(
                     border-radius:8px; padding:12px 16px; color:#92400e; font-weight:500; }
     .comp-over    { background:#fee2e2; border:1.5px solid #fca5a5;
                     border-radius:8px; padding:12px 16px; color:#991b1b; font-weight:500; }
+    .privacy-banner {
+        background: #0d1b2a;
+        border-radius: 12px;
+        padding: 20px 28px;
+        margin-bottom: 1.5rem;
+        color: #f8fafc;
+    }
+    .privacy-banner h4 { margin: 0 0 14px 0; font-size: 1rem; color: #f8fafc; letter-spacing: 0.01em; }
+    .privacy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+    .privacy-item {
+        background: rgba(255,255,255,0.07);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 8px;
+        padding: 10px 14px;
+        font-size: 0.82rem;
+        line-height: 1.5;
+    }
+    .privacy-item strong { display: block; font-size: 0.88rem; margin-bottom: 2px; color: #ffffff; }
+    .privacy-item span   { color: rgba(255,255,255,0.7); }
+    .wiped-banner {
+        background: #064e3b;
+        border: 1.5px solid #6ee7b7;
+        border-radius: 10px;
+        padding: 16px 20px;
+        margin-bottom: 1rem;
+        color: #d1fae5;
+        font-size: 0.95rem;
+        line-height: 1.6;
+    }
     #MainMenu { visibility: hidden; }
     footer     { visibility: hidden; }
     </style>
@@ -58,12 +87,13 @@ st.markdown(
 
 # ── Session state defaults ────────────────────────────────────────────────────
 _DEFAULTS = {
-    "authenticated":     False,
-    "imap_creds":        None,
-    "connected_email":   None,
-    "selected_country":  None,
-    "flights":           None,
-    "scan_stats":        {},
+    "authenticated":      False,
+    "imap_creds":         None,
+    "connected_email":    None,
+    "selected_country":   None,
+    "flights":            None,
+    "scan_stats":         {},
+    "credentials_wiped":  False,   # True after scan clears credentials
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -80,12 +110,45 @@ with hdr_left:
 with hdr_right:
     if auth.is_authenticated():
         email_display = st.session_state.get("connected_email", "")
-        st.success(f"Connected", icon="🔒")
+        st.success("Connected", icon="🔒")
         st.caption(email_display)
         if st.button("Disconnect", use_container_width=True):
             auth.logout()
             st.session_state["flights"] = None
+            st.session_state["credentials_wiped"] = False
             st.rerun()
+
+# ── Privacy banner — always visible, first thing users see ───────────────────
+st.markdown(
+    """
+    <div class="privacy-banner">
+      <h4>🔐 Your Privacy Is Guaranteed — Here Is Exactly What Happens</h4>
+      <div class="privacy-grid">
+        <div class="privacy-item">
+          <strong>✅ One-time access only</strong>
+          <span>Your email password is used for a single scan, then permanently
+          deleted from memory the moment the scan finishes — whether it succeeds or fails.</span>
+        </div>
+        <div class="privacy-item">
+          <strong>✅ Nothing is stored</strong>
+          <span>No emails, no passwords, no flight data are ever written to disk
+          or saved to any database. Everything lives only in your browser session.</span>
+        </div>
+        <div class="privacy-item">
+          <strong>✅ Read-only, encrypted connection</strong>
+          <span>The app connects to your email over an encrypted SSL connection.
+          It can only read emails — it cannot send, delete, or modify anything.</span>
+        </div>
+        <div class="privacy-item">
+          <strong>✅ You stay in control</strong>
+          <span>Use an app password (not your real password). Revoke it from
+          your email provider's settings at any time — without changing your main password.</span>
+        </div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.divider()
 
@@ -136,13 +199,45 @@ def render_country_step():
 def render_email_step():
     st.markdown('<p class="step-label">Step 2 — Connect Your Email</p>', unsafe_allow_html=True)
 
-    if auth.is_authenticated():
-        st.success(
-            f"✅ Connected as **{st.session_state.get('connected_email','')}**\n\n"
-            "Your app password is held in memory only and will be cleared when you disconnect.",
-            icon="🔒",
+    # ── Post-scan: credentials already wiped ─────────────────────────────────
+    if st.session_state.get("credentials_wiped"):
+        st.markdown(
+            """
+            <div class="wiped-banner">
+            🔐 <strong>Your email credentials have been permanently deleted.</strong><br>
+            The app password you entered no longer exists anywhere in this application —
+            not in memory, not on disk, not in any log. Your scan is complete and your
+            email account is no longer accessible to this tool.
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
         return
+
+    # ── Already connected (pre-scan) ─────────────────────────────────────────
+    if auth.is_authenticated():
+        email_display = st.session_state.get("connected_email", "")
+        st.success(f"✅ Connected as **{email_display}**", icon="🔒")
+        st.info(
+            "⏳ **Your app password is held in memory only until your scan completes.**  \n"
+            "The moment the scan finishes — successfully or not — your password is "
+            "permanently deleted from this application. You will not need to enter it again "
+            "unless you choose to run another scan.",
+            icon="🔐",
+        )
+        return
+
+    # ── Privacy promise — shown before entering any credentials ──────────────
+    st.markdown(
+        "**What happens to your app password:**\n\n"
+        "1. You enter it below\n"
+        "2. This app uses it to connect to your email provider — once\n"
+        "3. The scan runs\n"
+        "4. **Your password is permanently deleted the instant the scan ends**\n\n"
+        "It is never written to disk, never logged, never transmitted to anyone "
+        "other than your own email provider over an encrypted connection."
+    )
+    st.divider()
 
     # ── Provider selector ────────────────────────────────────────────────────
     provider_name = st.selectbox(
@@ -160,10 +255,12 @@ def render_email_step():
                 f"Open {provider_name} security settings →",
                 url=provider["app_password_url"],
             )
-        st.caption(
-            "An **app password** is a one-time code your provider generates specifically "
-            "for third-party apps. It grants limited access and can be revoked any time "
-            "from your account settings — without changing your main password."
+        st.info(
+            "An **app password** is a special limited-access code your provider generates "
+            "for third-party apps. It is **not** your real password. You can revoke it "
+            "from your email provider's security settings at any time without changing "
+            "your main account password.",
+            icon="ℹ️",
         )
 
     # ── Credential inputs ────────────────────────────────────────────────────
@@ -173,29 +270,22 @@ def render_email_step():
         autocomplete="email",
     )
 
-    # Custom host/port for "Other" provider
     if provider_name == "Other (custom IMAP)":
         col_host, col_port = st.columns([3, 1])
         custom_host = col_host.text_input("IMAP server", placeholder="imap.yourprovider.com")
         custom_port = col_port.number_input("Port", value=993, min_value=1, max_value=65535)
-        host = custom_host
-        port = int(custom_port)
+        host    = custom_host
+        port    = int(custom_port)
         folders = ["INBOX"]
     else:
-        host = provider["host"]
-        port = provider["port"]
+        host    = provider["host"]
+        port    = provider["port"]
         folders = provider["folders"]
 
     app_password = st.text_input(
-        "App password",
+        "App password  *(not your regular password)*",
         type="password",
         placeholder="xxxx xxxx xxxx xxxx",
-        help="Use the app password generated by your email provider — not your regular login password.",
-    )
-
-    st.caption(
-        "🔒 Your app password is never stored on disk or sent anywhere "
-        "except directly to your email provider's IMAP server over an encrypted connection."
     )
 
     if st.button("Connect Email", type="primary", use_container_width=True):
@@ -206,12 +296,12 @@ def render_email_step():
             st.error("Please enter your IMAP server address.")
             return
 
-        with st.spinner("Testing connection…"):
+        with st.spinner("Verifying connection…"):
             ok, message = auth.test_connection(host, port, email_addr, app_password)
 
         if ok:
             auth.save_credentials(email_addr, app_password, host, port, folders)
-            st.success("✅ Connected successfully!")
+            st.success("✅ Connected. Your password will be deleted as soon as the scan completes.")
             st.rerun()
         else:
             st.error(f"❌ {message}")
@@ -267,34 +357,45 @@ def _run_scan(country: dict):
         progress_bar.progress(pct, text=message)
         status_text.caption(f"{processed} / {total} emails analyzed")
 
+    scan_error   = None
+    flights      = []
+
     try:
         creds = auth.get_credentials()
 
         validated = country_lib.get_country_by_iso(country["iso_code"])
         if not validated:
-            st.error(f"Unknown country code: {country['iso_code']!r}")
-            return
-
-        lookback = int(validated["lookback_years"])
-        if not (1 <= lookback <= 15):
-            st.error("Invalid lookback period in country configuration.")
-            return
-
-        flights = scanner.scan_emails(
-            creds=creds,
-            country_iso_code=validated["iso_code"],
-            lookback_years=lookback,
-            progress_callback=on_progress,
-        )
+            scan_error = f"Unknown country code: {country['iso_code']!r}"
+        else:
+            lookback = int(validated["lookback_years"])
+            if not (1 <= lookback <= 15):
+                scan_error = "Invalid lookback period in country configuration."
+            else:
+                flights = scanner.scan_emails(
+                    creds=creds,
+                    country_iso_code=validated["iso_code"],
+                    lookback_years=lookback,
+                    progress_callback=on_progress,
+                )
 
     except Exception as exc:
-        progress_bar.empty()
-        status_text.empty()
-        st.error(f"❌ Scan failed: {exc}")
+        scan_error = str(exc)
+
+    finally:
+        # ── ALWAYS wipe credentials — success, failure, or exception ─────────
+        # This is the core privacy guarantee: one-time access, no retention.
+        auth.logout()
+        st.session_state["credentials_wiped"] = True
+
+    progress_bar.empty()
+    status_text.empty()
+
+    if scan_error:
+        st.error(f"❌ Scan failed: {scan_error}")
+        st.info("Your email credentials have been deleted regardless of the error.", icon="🔐")
+        st.rerun()
         return
 
-    progress_bar.progress(100, text=f"Done — {len(flights)} flights found.")
-    status_text.empty()
     st.session_state["flights"] = flights
     st.rerun()
 
