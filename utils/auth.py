@@ -1,23 +1,32 @@
 """
 Google OAuth 2.0 authentication for Streamlit.
 
-Root cause of the session loss problem:
-  Streamlit creates a NEW session when Google redirects back to the app —
-  the WebSocket connection was dropped while the user was on Google's page.
-  Any oauth_state stored in st.session_state before the redirect is gone.
+Two challenges solved here:
 
-Fix: HMAC-signed state tokens.
-  Instead of storing state server-side and comparing on callback, we encode
-  a cryptographically signed token as the state parameter. The signature can
-  be verified on any session without storage — equivalent CSRF protection,
-  zero session dependency.
+1. Streamlit session loss on redirect
+   When the user leaves to Google and returns, Streamlit creates a NEW session.
+   Any data stored in st.session_state before the redirect is gone.
+   Fix: HMAC-signed state tokens — self-verifying, no session storage needed.
+
+2. PKCE code_verifier lost across sessions
+   google-auth-oauthlib generates a PKCE code_verifier when building the
+   auth URL. On callback we create a fresh Flow — it has no code_verifier.
+   Google rejects the token exchange with "Missing code verifier."
+   Fix: We generate our own PKCE pair and embed the code_verifier inside
+   the signed state token. It travels with the OAuth redirect and is
+   extracted on callback — no session dependency.
+
+State token format:
+    base64url(code_verifier) + "." + base64url(HMAC-SHA256(code_verifier))
+    The code_verifier is 32 bytes of cryptographic randomness — it doubles
+    as both the CSRF nonce and the PKCE verifier.
 
 Other security design:
   - FIX C-1: No shared OAuth singleton. Fresh Flow/Credentials per operation.
-  - FIX H-3: Secrets loaded from st.secrets or env — fails fast if missing.
+  - FIX H-3: Secrets fail fast if missing — no silent fallback defaults.
   - FIX M-3: Tokens live only in st.session_state (per-user RAM, never disk).
   - FIX M-4: access_type='offline' so refresh tokens are issued.
-  - Privacy guarantee: logout() wipes all token state after every scan.
+  - Privacy: logout() wipes all token state after every scan.
 """
 
 import base64
@@ -36,7 +45,6 @@ GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 # ── Secrets ───────────────────────────────────────────────────────────────────
 
 def _get_secret(key: str) -> str:
-    """Load from st.secrets (Streamlit Cloud) or env (local). Fails fast."""
     try:
         val = st.secrets.get(key)
         if val:
@@ -60,38 +68,52 @@ def get_redirect_uri() -> str:
     return uri or os.getenv("REDIRECT_URI") or "http://localhost:8501"
 
 
-# ── HMAC-signed state tokens ──────────────────────────────────────────────────
-# These survive Streamlit's session recreation on redirect because they are
-# self-verifying — no server-side storage needed.
+# ── PKCE helpers ──────────────────────────────────────────────────────────────
 
-def _make_signed_state() -> str:
-    """Create a signed state token: base64(nonce) + '.' + base64(HMAC).
+def _generate_pkce() -> tuple[str, str]:
+    """Generate a PKCE code_verifier and its S256 code_challenge.
 
-    The nonce provides uniqueness; the HMAC proves the token was issued by
-    this server. Signing key is the GOOGLE_CLIENT_SECRET so it's secret and
-    stable across Streamlit session boundaries.
+    code_verifier: 32 bytes of cryptographic randomness, base64url-encoded.
+    code_challenge: SHA-256(code_verifier), base64url-encoded (no padding).
     """
-    nonce = secrets.token_bytes(32)
-    nonce_b64 = base64.urlsafe_b64encode(nonce).decode().rstrip("=")
+    raw = secrets.token_bytes(32)
+    code_verifier  = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    digest         = hashlib.sha256(code_verifier.encode()).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+    return code_verifier, code_challenge
+
+
+# ── Signed state tokens ───────────────────────────────────────────────────────
+
+def _make_signed_state(code_verifier: str) -> str:
+    """Sign the code_verifier with HMAC-SHA256 to create the OAuth state token.
+
+    Format: base64url(code_verifier) + "." + base64url(HMAC)
+    The code_verifier is already base64url-encoded, so we sign it directly.
+    The GOOGLE_CLIENT_SECRET is the signing key — stable and secret.
+    """
     key = _get_secret("GOOGLE_CLIENT_SECRET").encode()
-    sig = hmac.new(key, nonce_b64.encode(), hashlib.sha256).digest()
+    sig = hmac.new(key, code_verifier.encode(), hashlib.sha256).digest()
     sig_b64 = base64.urlsafe_b64encode(sig).decode().rstrip("=")
-    return f"{nonce_b64}.{sig_b64}"
+    return f"{code_verifier}.{sig_b64}"
 
 
-def _verify_signed_state(state: str) -> bool:
-    """Verify an HMAC-signed state token. Returns False on any failure."""
+def _verify_and_extract(state: str) -> str | None:
+    """Verify the signed state token and return the code_verifier.
+
+    Returns None if the signature is invalid — caller should raise ValueError.
+    Uses constant-time comparison to prevent timing attacks.
+    """
     try:
-        parts = state.rsplit(".", 1)
-        if len(parts) != 2:
-            return False
-        nonce_b64, received_sig_b64 = parts
+        cv, received_sig = state.rsplit(".", 1)
         key = _get_secret("GOOGLE_CLIENT_SECRET").encode()
-        expected_sig = hmac.new(key, nonce_b64.encode(), hashlib.sha256).digest()
+        expected_sig = hmac.new(key, cv.encode(), hashlib.sha256).digest()
         expected_b64 = base64.urlsafe_b64encode(expected_sig).decode().rstrip("=")
-        return hmac.compare_digest(received_sig_b64, expected_b64)
+        if hmac.compare_digest(received_sig, expected_b64):
+            return cv
     except Exception:
-        return False
+        pass
+    return None
 
 
 # ── OAuth Flow ────────────────────────────────────────────────────────────────
@@ -113,40 +135,40 @@ def _make_flow() -> Flow:
 
 
 def get_auth_url() -> str:
-    """Generate the Google sign-in URL with a signed state token.
+    """Build the Google sign-in URL with self-contained PKCE + CSRF state.
 
-    The state is HMAC-signed so it can be verified on callback without
-    session storage — survives Streamlit's session recreation on redirect.
+    We generate the PKCE pair ourselves so the code_verifier can be embedded
+    in the signed state token and recovered on callback without session storage.
     """
-    flow  = _make_flow()
-    state = _make_signed_state()
+    code_verifier, code_challenge = _generate_pkce()
+    state = _make_signed_state(code_verifier)
 
+    flow = _make_flow()
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         prompt="select_account",
         state=state,
+        code_challenge=code_challenge,
+        code_challenge_method="S256",
         include_granted_scopes="true",
     )
     return auth_url
 
 
 def handle_oauth_callback(code: str, returned_state: str) -> None:
-    """Exchange authorization code for tokens after verifying signed state.
-
-    Raises ValueError if the state signature is invalid (CSRF protection).
-    Tokens stored only in st.session_state (Fix M-3, Fix C-1).
-    """
-    if not _verify_signed_state(returned_state):
+    """Verify signed state, recover code_verifier, exchange code for tokens."""
+    code_verifier = _verify_and_extract(returned_state)
+    if not code_verifier:
         raise ValueError(
             "OAuth state verification failed — possible CSRF attempt. "
             "Please start the sign-in flow again."
         )
 
     flow = _make_flow()
-
-    # Pass the state through so requests_oauthlib doesn't re-validate it
-    # with a session it doesn't have
-    flow.fetch_token(code=code, state=returned_state)
+    flow.fetch_token(
+        code=code,
+        code_verifier=code_verifier,   # Required — completes the PKCE exchange
+    )
     creds = flow.credentials
 
     st.session_state["google_creds"] = {
@@ -162,9 +184,7 @@ def handle_oauth_callback(code: str, returned_state: str) -> None:
 
 
 def get_credentials() -> Credentials:
-    """Reconstruct a fresh Credentials object from session state (Fix C-1).
-    Auto-refreshes if expired (Fix M-4).
-    """
+    """Reconstruct a fresh Credentials object from session state (Fix C-1)."""
     raw = st.session_state.get("google_creds")
     if not raw:
         raise RuntimeError("Not signed in. Please connect with Google first.")
