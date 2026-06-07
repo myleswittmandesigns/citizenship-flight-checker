@@ -27,7 +27,7 @@ import re
 from datetime import datetime
 
 import airportsdata
-from dateutil import parser as dateutil_parse, ParserError
+from dateutil.parser import parse as dateutil_parse, ParserError
 
 # ── IATA airport database (loaded once at import time, ~50 ms) ────────────────
 _AIRPORTS: dict = airportsdata.load("IATA")
@@ -379,7 +379,7 @@ def _find_dates(text: str) -> list[tuple[str, int]]:
     for m in _DATE_CONTEXT_RE.finditer(text):
         raw = m.group(0).strip()
         try:
-            dt = dateutil_parse.parse(raw, fuzzy=False)
+            dt = dateutil_parse(raw, fuzzy=False)
             # Sanity: ignore dates outside plausible flight range
             if dt.year < 1990 or dt.year > datetime.now().year + 2:
                 continue
@@ -457,7 +457,7 @@ def _extract_segments(
     fallback_date: str | None = None
     if email_date:
         try:
-            fallback_date = dateutil_parse.parse(email_date, fuzzy=True).strftime("%Y-%m-%d")
+            fallback_date = dateutil_parse(email_date, fuzzy=True).strftime("%Y-%m-%d")
         except (ParserError, ValueError):
             pass
 
