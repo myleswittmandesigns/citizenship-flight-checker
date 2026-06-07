@@ -214,9 +214,9 @@ def render_country_step():
 
     st.write("")
     name = st.text_input(
-        "Your full name (as it appears on bookings)",
+        "Your full name (as printed on your boarding pass)",
         value=st.session_state.get("passenger_name", ""),
-        placeholder="e.g. Jane Smith",
+        placeholder="e.g. JANE SMITH",
         help=(
             "Optional but recommended. Used to distinguish your own flights "
             "from travel plans that friends or colleagues may have forwarded "
