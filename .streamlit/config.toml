@@ -1,0 +1,17 @@
+[theme]
+primaryColor      = "#2563eb"
+backgroundColor   = "#ffffff"
+secondaryBackgroundColor = "#f1f5f9"
+textColor         = "#1e293b"
+font              = "sans serif"
+
+[server]
+# Prevents Streamlit from collecting usage stats
+enableStatistics  = false
+# Required for OAuth redirect to work correctly
+enableCORS        = false
+enableXsrfProtection = true
+
+[browser]
+# Don't open browser automatically in production
+gatherUsageStats  = false

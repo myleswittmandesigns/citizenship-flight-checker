@@ -1,0 +1,54 @@
+{
+  "countries": [
+    {
+      "id": "us",
+      "name": "United States",
+      "iso_code": "US",
+      "flag": "🇺🇸",
+      "lookback_years": 5,
+      "max_days_abroad_per_year": 180,
+      "calculation_method": "per_year",
+      "notes": "USCIS requires continuous residence. Any single trip exceeding 6 months (180 days) may break continuous residence. Trips of 1 year or more will disrupt eligibility."
+    },
+    {
+      "id": "uk",
+      "name": "United Kingdom",
+      "iso_code": "GB",
+      "flag": "🇬🇧",
+      "lookback_years": 5,
+      "max_days_abroad_per_year": 90,
+      "calculation_method": "per_year",
+      "notes": "For British citizenship, applicants must not have spent more than 90 days outside the UK in the 12 months before applying, and no more than 450 days total over the 5-year qualifying period."
+    },
+    {
+      "id": "ca",
+      "name": "Canada",
+      "iso_code": "CA",
+      "flag": "🇨🇦",
+      "lookback_years": 5,
+      "max_days_abroad_total": 635,
+      "calculation_method": "total",
+      "notes": "Must be physically present in Canada for at least 1,095 days (3 years) out of the 5 years before applying. Maximum 635 days abroad over the entire 5-year window."
+    },
+    {
+      "id": "au",
+      "name": "Australia",
+      "iso_code": "AU",
+      "flag": "🇦🇺",
+      "lookback_years": 4,
+      "max_days_abroad_total": 365,
+      "calculation_method": "total",
+      "notes": "Must be physically present in Australia for 4 years before applying (including 1 year as a permanent resident). Maximum 365 days abroad total over the 4-year period."
+    },
+    {
+      "id": "de",
+      "name": "Germany",
+      "iso_code": "DE",
+      "flag": "🇩🇪",
+      "lookback_years": 5,
+      "max_days_abroad_per_year": 180,
+      "calculation_method": "per_year",
+      "notes": "Generally requires 5 years of lawful habitual residence (reduced to 3 for special integration). Absences exceeding 6 months within a year may interrupt the qualifying period."
+    }
+  ]
+}
