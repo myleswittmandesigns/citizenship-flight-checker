@@ -177,7 +177,7 @@ st.divider()
 # STEP 1 — SELECT COUNTRY
 # ─────────────────────────────────────────────────────────────────────────────
 def render_country_step():
-    st.markdown('<p class="step-label">Step 1 — Select Country</p>', unsafe_allow_html=True)
+    st.markdown('<p class="step-label">Step 2 — Select Country</p>', unsafe_allow_html=True)
 
     all_countries = country_lib.load_countries()
     if not all_countries:
@@ -231,7 +231,7 @@ def render_country_step():
 # STEP 2 — CONNECT EMAIL (IMAP)
 # ─────────────────────────────────────────────────────────────────────────────
 def render_email_step():
-    st.markdown('<p class="step-label">Step 2 — Connect Your Gmail</p>', unsafe_allow_html=True)
+    st.markdown('<p class="step-label">Step 1 — Connect Your Gmail</p>', unsafe_allow_html=True)
 
     # ── Post-scan: credentials already wiped ─────────────────────────────────
     if st.session_state.get("credentials_wiped"):
@@ -298,10 +298,10 @@ def render_scan_step():
 
     if not ready:
         missing = []
-        if not country:
-            missing.append("select a country (Step 1)")
         if not auth.is_authenticated():
-            missing.append("connect your email (Step 2)")
+            missing.append("connect your Gmail (Step 1)")
+        if not country:
+            missing.append("select a country (Step 2)")
         st.button(
             "✈️ Start Scan",
             disabled=True,
@@ -566,9 +566,9 @@ def render_country_manager():
 # ─────────────────────────────────────────────────────────────────────────────
 col_left, col_right = st.columns([1, 1], gap="large")
 with col_left:
-    render_country_step()
-with col_right:
     render_email_step()
+with col_right:
+    render_country_step()
 
 st.divider()
 render_scan_step()
