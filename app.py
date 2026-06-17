@@ -372,14 +372,55 @@ def _run_scan(country: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESULTS
+# RESULTS + FLIGHT REVIEW
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _flights_to_editor_df(flights: list[dict], country_iso: str) -> pd.DataFrame:
+    """Convert raw flight dicts into the editable review DataFrame."""
+    rows = []
+    for f in flights:
+        dep_parts = " ".join(filter(None, [f.get("departure_airport"), f.get("departure_city")]))
+        arr_parts = " ".join(filter(None, [f.get("arrival_airport"), f.get("arrival_city")]))
+        rows.append({
+            "✓ Include":       True,
+            "Dep. Date":       f.get("departure_date") or "",
+            "Airline":         f.get("airline") or "",
+            "Flight #":        f.get("flight_number") or "",
+            "From":            dep_parts or "",
+            "Dep. Country":    f.get("departure_country") or "",
+            "To":              arr_parts or "",
+            "Arr. Country":    f.get("arrival_country") or "",
+            "Arr. Date":       f.get("arrival_date") or "",
+            "Booking Ref":     f.get("booking_reference") or "",
+        })
+    return pd.DataFrame(rows)
+
+
+def _editor_row_to_flight(row: pd.Series) -> dict:
+    """Convert an edited review row back into a flight dict for compliance."""
+    from_parts = str(row.get("From", "")).split()
+    to_parts   = str(row.get("To", "")).split()
+    return {
+        "departure_date":    row.get("Dep. Date") or None,
+        "arrival_date":      row.get("Arr. Date") or None,
+        "airline":           row.get("Airline") or None,
+        "flight_number":     row.get("Flight #") or None,
+        "departure_airport": from_parts[0].upper() if from_parts else None,
+        "departure_city":    " ".join(from_parts[1:]) if len(from_parts) > 1 else None,
+        "departure_country": row.get("Dep. Country") or None,
+        "arrival_airport":   to_parts[0].upper() if to_parts else None,
+        "arrival_city":      " ".join(to_parts[1:]) if len(to_parts) > 1 else None,
+        "arrival_country":   row.get("Arr. Country") or None,
+        "booking_reference": row.get("Booking Ref") or None,
+    }
+
+
 def render_results():
     flights     = st.session_state.get("flights")
     country     = st.session_state.get("selected_country")
     scan_error  = st.session_state.get("scan_error")
 
-    # Show a persistent error even when no flights came back
+    # ── Persistent scan error ────────────────────────────────────────────────
     if scan_error and st.session_state.get("credentials_wiped"):
         st.divider()
         st.error(f"❌ Scan failed: {scan_error}")
@@ -398,100 +439,140 @@ def render_results():
         return
 
     st.divider()
-    st.subheader("📊 Results")
 
-    compliance = comp_lib.check_compliance(flights, country)
-    periods    = compliance.periods
-    total_days = compliance.total_days
+    # ── No flights found ─────────────────────────────────────────────────────
+    if not flights:
+        st.subheader(f"✈️ {country.get('flag','')} {country['name']} — No flights found")
+        st.info(
+            "No matching flights were detected. This may mean:\n\n"
+            "- Flight bookings were made with a different email address\n"
+            "- Tickets were purchased by phone or through a travel agent (no email)\n"
+            "- The confirmation emails were deleted before the scan window\n\n"
+            "You can still download a blank template CSV to fill in manually.",
+            icon="🔍",
+        )
+        return
 
-    dates = sorted([f["departure_date"] for f in flights if f.get("departure_date")])
-    date_range = f"{dates[0]} → {dates[-1]}" if len(dates) >= 2 else (dates[0] if dates else "—")
+    # ── Review header ────────────────────────────────────────────────────────
+    st.subheader(f"📋 Review Flights — {country.get('flag','')} {country['name']}")
+    st.markdown(
+        "The scan found the flights below. **Review each row before exporting:**\n\n"
+        "- **Uncheck** any flight that doesn't belong to you or was extracted incorrectly\n"
+        "- **Edit cells** directly to fix dates, airline names, airport codes, or countries\n"
+        "- **Delete a row** with the 🗑 button at the right of each row\n\n"
+        "The compliance summary and CSV export update live as you make changes."
+    )
+    st.write("")
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("✈️ Flights Found",         len(flights))
-    m2.metric("🌍 Abroad Trips",          len(periods))
-    m3.metric("📅 Est. Days Abroad",       total_days)
-    m4.metric("🗓️ Date Range",             date_range)
+    # ── Editable flight table ────────────────────────────────────────────────
+    editor_df = _flights_to_editor_df(flights, country["iso_code"])
 
-    # Compliance alert
+    edited = st.data_editor(
+        editor_df,
+        column_config={
+            "✓ Include": st.column_config.CheckboxColumn(
+                "✓",
+                help="Uncheck to exclude this flight from compliance and CSV export",
+                width="small",
+                default=True,
+            ),
+            "Dep. Date": st.column_config.TextColumn(
+                "Dep. Date",
+                help="YYYY-MM-DD",
+                width="small",
+            ),
+            "Airline": st.column_config.TextColumn("Airline", width="medium"),
+            "Flight #": st.column_config.TextColumn("Flight #", width="small"),
+            "From": st.column_config.TextColumn(
+                "From",
+                help="Airport code + city, e.g. JFK New York",
+                width="medium",
+            ),
+            "Dep. Country": st.column_config.TextColumn(
+                "Dep. Country",
+                help="2-letter ISO code, e.g. US",
+                width="small",
+            ),
+            "To": st.column_config.TextColumn(
+                "To",
+                help="Airport code + city, e.g. LHR London",
+                width="medium",
+            ),
+            "Arr. Country": st.column_config.TextColumn(
+                "Arr. Country",
+                help="2-letter ISO code, e.g. GB",
+                width="small",
+            ),
+            "Arr. Date": st.column_config.TextColumn(
+                "Arr. Date",
+                help="YYYY-MM-DD (optional)",
+                width="small",
+            ),
+            "Booking Ref": st.column_config.TextColumn("Booking Ref", width="small"),
+        },
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="flight_review_editor",
+    )
+
+    # ── Live metrics from edited state ───────────────────────────────────────
+    included_mask = edited["✓ Include"].fillna(False).astype(bool)
+    included_rows = edited[included_mask]
+    n_total    = len(edited)
+    n_included = len(included_rows)
+    n_excluded = n_total - n_included
+
+    st.write("")
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("✈️ Total detected", n_total)
+    mc2.metric("✅ Included",        n_included)
+    mc3.metric("❌ Excluded",        n_excluded)
+
+    if n_included == 0:
+        st.warning("No flights are currently included. Check at least one row to enable export.", icon="⚠️")
+        return
+
+    # ── Compliance — recalculates live from included rows ────────────────────
+    included_flights = [_editor_row_to_flight(row) for _, row in included_rows.iterrows()]
+    compliance  = comp_lib.check_compliance(included_flights, country)
     css = {"ok": "comp-ok", "warning": "comp-warning", "over": "comp-over"}[compliance.status]
+
+    st.write("")
     st.markdown(f'<div class="{css}">{compliance.message}</div>', unsafe_allow_html=True)
     st.write("")
 
-    # Year-by-year breakdown
     if compliance.yearly_breakdown:
         with st.expander("📆 Year-by-year breakdown"):
-            method      = country.get("calculation_method", "per_year")
-            max_per_yr  = country.get("max_days_abroad_per_year") if method == "per_year" else None
+            method     = country.get("calculation_method", "per_year")
+            max_per_yr = country.get("max_days_abroad_per_year") if method == "per_year" else None
             year_df = pd.DataFrame([
                 {
-                    "Year":               yr,
-                    "Est. Days Abroad":   days,
-                    "Status":             "⚠️ Over limit" if max_per_yr and days > max_per_yr else "✅ OK",
+                    "Year":             yr,
+                    "Est. Days Abroad": days,
+                    "Status":           "⚠️ Over limit" if max_per_yr and days > max_per_yr else "✅ OK",
                 }
                 for yr, days in sorted(compliance.yearly_breakdown.items())
             ])
             st.dataframe(year_df, use_container_width=True, hide_index=True)
 
-    # Flight table
-    st.subheader(f"Flight History — {country.get('flag','')} {country['name']}")
-
-    if not flights:
-        st.info(
-            "No matching flights found. Flight bookings made by phone, through a travel agent, "
-            "or with a different email address won't appear here.",
-            icon="🔍",
-        )
-        return
-
-    def direction(f: dict) -> str:
-        dep = f.get("departure_country") == country["iso_code"]
-        arr = f.get("arrival_country")   == country["iso_code"]
-        if dep and not arr:
-            return "🛫 Departure"
-        if arr and not dep:
-            return "🛬 Return"
-        return "↔️ Other"
-
-    df = pd.DataFrame([
-        {
-            "Departure Date":  f.get("departure_date") or "—",
-            "Airline":         f.get("airline") or "—",
-            "Flight #":        f.get("flight_number") or "—",
-            "Departed From":   (f"{f.get('departure_airport') or ''} {f.get('departure_city') or ''}").strip() or "—",
-            "Dep. Country":    f.get("departure_country") or "—",
-            "Arrived At":      (f"{f.get('arrival_airport') or ''} {f.get('arrival_city') or ''}").strip() or "—",
-            "Arr. Country":    f.get("arrival_country") or "—",
-            "Arrival Date":    f.get("arrival_date") or "—",
-            "Direction":       direction(f),
-            "Booking Ref":     f.get("booking_reference") or "—",
-        }
-        for f in flights
-    ])
-
-    search = st.text_input("🔍 Filter", placeholder="Search by city, airline, flight number…")
-    if search:
-        mask = df.apply(lambda row: row.astype(str).str.contains(search, case=False).any(), axis=1)
-        display_df = df[mask]
-    else:
-        display_df = df
-
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-    st.caption(f"Showing {len(display_df)} of {len(df)} flights")
-
-    # CSV download
+    # ── Export ───────────────────────────────────────────────────────────────
+    st.divider()
+    export_df    = included_rows.drop(columns=["✓ Include"])
     country_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", country["name"])
     today        = datetime.now().strftime("%Y-%m-%d")
+
     st.download_button(
-        label=f"⬇️ Download CSV  ({len(flights)} flights)",
-        data=df.to_csv(index=False).encode("utf-8"),
+        label=f"⬇️ Export {n_included} reviewed flight{'s' if n_included != 1 else ''} to CSV",
+        data=export_df.to_csv(index=False).encode("utf-8"),
         file_name=f"{country_slug}_flight_history_{today}.csv",
         mime="text/csv",
         use_container_width=True,
+        type="primary",
     )
 
     st.caption(
-        "⚠️ **Disclaimer:** This tool is an aid for organizing flight records only. "
+        "⚠️ **Disclaimer:** This tool is an aid for organising flight records only. "
         "Always verify against official airline records and consult a qualified "
         "immigration attorney before submitting to any government authority."
     )
