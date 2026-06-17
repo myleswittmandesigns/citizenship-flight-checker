@@ -273,14 +273,21 @@ def scan_emails(
             body    = _decode_body(payload)
 
             if body:
-                flights = extract_flights(
+                extracted = extract_flights(
                     body=body,
                     subject=subject,
                     sender=sender,
                     date=date,
                     passenger_name=passenger_name,
                 )
-                all_flights.extend(flights)
+                # Attach source-email metadata so the review UI can show the
+                # original email for each extracted flight.
+                for flight in extracted:
+                    flight["_source_subject"] = subject[:300]
+                    flight["_source_sender"]  = sender[:200]
+                    flight["_source_date"]    = date[:100]
+                    flight["_source_body"]    = body[:4000]
+                all_flights.extend(extracted)
         except Exception:
             pass
 

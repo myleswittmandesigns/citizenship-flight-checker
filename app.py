@@ -95,6 +95,38 @@ st.markdown(
         font-size: 0.95rem;
         line-height: 1.6;
     }
+    .review-card {
+        background: #f8fafc;
+        border: 1.5px solid #e2e8f0;
+        border-radius: 14px;
+        padding: 28px 32px;
+        margin: 1rem 0 1.5rem 0;
+    }
+    .route-header {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        margin: 0.5rem 0 1.2rem 0;
+    }
+    .route-airport {
+        font-size: 2.4rem;
+        font-weight: 800;
+        color: #0f172a;
+        letter-spacing: 0.04em;
+        text-align: center;
+    }
+    .route-city {
+        font-size: 0.78rem;
+        color: #64748b;
+        text-align: center;
+        margin-top: -6px;
+    }
+    .route-arrow {
+        font-size: 1.8rem;
+        color: #94a3b8;
+        padding-bottom: 4px;
+    }
     #MainMenu { visibility: hidden; }
     footer     { visibility: hidden; }
     </style>
@@ -108,12 +140,15 @@ _DEFAULTS = {
     "google_creds":       None,
     "connected_email":    None,
     "selected_country":   None,
-    "passenger_name":     "",      # Optional — improves passenger vs. visitor filtering
+    "passenger_name":     "",
     "flights":            None,
     "scan_stats":         {},
-    "credentials_wiped":  False,   # True after scan clears credentials
-    "scan_error":         None,    # Persists through rerun so the user sees it
+    "credentials_wiped":  False,
+    "scan_error":         None,
     "oauth_state":        None,
+    # Review flow
+    "review_index":       0,       # index into flights list currently being reviewed
+    "flight_decisions":   [],      # "keep" | "ignore" per flight, parallel to flights[]
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -366,59 +401,42 @@ def _run_scan(country: dict):
     progress_bar.empty()
     status_text.empty()
 
-    # Always store flights (empty list on error) so results section renders
-    st.session_state["flights"] = flights
-    st.rerun()   # Single rerun — session_state carries both flights and any error
+    # Always store flights and reset review state for the new scan
+    st.session_state["flights"]          = flights
+    st.session_state["review_index"]     = 0
+    st.session_state["flight_decisions"] = []
+    st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESULTS + FLIGHT REVIEW
+# EMAIL SOURCE DIALOG
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _flights_to_editor_df(flights: list[dict], country_iso: str) -> pd.DataFrame:
-    """Convert raw flight dicts into the editable review DataFrame."""
-    rows = []
-    for f in flights:
-        dep_parts = " ".join(filter(None, [f.get("departure_airport"), f.get("departure_city")]))
-        arr_parts = " ".join(filter(None, [f.get("arrival_airport"), f.get("arrival_city")]))
-        rows.append({
-            "✓ Include":       True,
-            "Dep. Date":       f.get("departure_date") or "",
-            "Airline":         f.get("airline") or "",
-            "Flight #":        f.get("flight_number") or "",
-            "From":            dep_parts or "",
-            "Dep. Country":    f.get("departure_country") or "",
-            "To":              arr_parts or "",
-            "Arr. Country":    f.get("arrival_country") or "",
-            "Arr. Date":       f.get("arrival_date") or "",
-            "Booking Ref":     f.get("booking_reference") or "",
-        })
-    return pd.DataFrame(rows)
+@st.dialog("📧 Source Email", width="large")
+def _email_viewer(subject: str, sender: str, date: str, body: str):
+    st.markdown(f"**From:** {sender or '—'}")
+    st.markdown(f"**Date:** {date or '—'}")
+    st.markdown(f"**Subject:** {subject or '—'}")
+    st.divider()
+    st.text_area(
+        "Email body",
+        value=body or "(no body content captured)",
+        height=400,
+        disabled=True,
+        label_visibility="collapsed",
+    )
+    if st.button("Close", use_container_width=True):
+        st.rerun()
 
 
-def _editor_row_to_flight(row: pd.Series) -> dict:
-    """Convert an edited review row back into a flight dict for compliance."""
-    from_parts = str(row.get("From", "")).split()
-    to_parts   = str(row.get("To", "")).split()
-    return {
-        "departure_date":    row.get("Dep. Date") or None,
-        "arrival_date":      row.get("Arr. Date") or None,
-        "airline":           row.get("Airline") or None,
-        "flight_number":     row.get("Flight #") or None,
-        "departure_airport": from_parts[0].upper() if from_parts else None,
-        "departure_city":    " ".join(from_parts[1:]) if len(from_parts) > 1 else None,
-        "departure_country": row.get("Dep. Country") or None,
-        "arrival_airport":   to_parts[0].upper() if to_parts else None,
-        "arrival_city":      " ".join(to_parts[1:]) if len(to_parts) > 1 else None,
-        "arrival_country":   row.get("Arr. Country") or None,
-        "booking_reference": row.get("Booking Ref") or None,
-    }
-
+# ─────────────────────────────────────────────────────────────────────────────
+# RESULTS — routes between review and final summary
+# ─────────────────────────────────────────────────────────────────────────────
 
 def render_results():
-    flights     = st.session_state.get("flights")
-    country     = st.session_state.get("selected_country")
-    scan_error  = st.session_state.get("scan_error")
+    flights    = st.session_state.get("flights")
+    country    = st.session_state.get("selected_country")
+    scan_error = st.session_state.get("scan_error")
 
     # ── Persistent scan error ────────────────────────────────────────────────
     if scan_error and st.session_state.get("credentials_wiped"):
@@ -440,142 +458,215 @@ def render_results():
 
     st.divider()
 
-    # ── No flights found ─────────────────────────────────────────────────────
     if not flights:
         st.subheader(f"✈️ {country.get('flag','')} {country['name']} — No flights found")
         st.info(
             "No matching flights were detected. This may mean:\n\n"
             "- Flight bookings were made with a different email address\n"
             "- Tickets were purchased by phone or through a travel agent (no email)\n"
-            "- The confirmation emails were deleted before the scan window\n\n"
-            "You can still download a blank template CSV to fill in manually.",
+            "- The confirmation emails were deleted before the scan window",
             icon="🔍",
         )
         return
 
-    # ── Review header ────────────────────────────────────────────────────────
-    st.subheader(f"📋 Review Flights — {country.get('flag','')} {country['name']}")
+    idx       = st.session_state.get("review_index", 0)
+    decisions = st.session_state.get("flight_decisions", [])
+
+    if idx < len(flights):
+        _render_review_card(flights, idx, decisions, country)
+    else:
+        _render_final_results(flights, decisions, country)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REVIEW CARD — one flight at a time
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_review_card(
+    flights: list[dict],
+    idx: int,
+    decisions: list[str],
+    country: dict,
+):
+    total = len(flights)
+    f     = flights[idx]
+
+    # Progress
+    st.progress((idx) / total, text=f"Flight {idx + 1} of {total}")
+    st.write("")
+
+    # ── Route display ────────────────────────────────────────────────────────
+    dep_code = f.get("departure_airport") or "?"
+    arr_code = f.get("arrival_airport")   or "?"
+    dep_city = ", ".join(filter(None, [f.get("departure_city"), f.get("departure_country")]))
+    arr_city = ", ".join(filter(None, [f.get("arrival_city"),   f.get("arrival_country")]))
+
     st.markdown(
-        "The scan found the flights below. **Review each row before exporting:**\n\n"
-        "- **Uncheck** any flight that doesn't belong to you or was extracted incorrectly\n"
-        "- **Edit cells** directly to fix dates, airline names, airport codes, or countries\n"
-        "- **Delete a row** with the 🗑 button at the right of each row\n\n"
-        "The compliance summary and CSV export update live as you make changes."
-    )
-    st.write("")
-
-    # ── Editable flight table ────────────────────────────────────────────────
-    editor_df = _flights_to_editor_df(flights, country["iso_code"])
-
-    edited = st.data_editor(
-        editor_df,
-        column_config={
-            "✓ Include": st.column_config.CheckboxColumn(
-                "✓",
-                help="Uncheck to exclude this flight from compliance and CSV export",
-                width="small",
-                default=True,
-            ),
-            "Dep. Date": st.column_config.TextColumn(
-                "Dep. Date",
-                help="YYYY-MM-DD",
-                width="small",
-            ),
-            "Airline": st.column_config.TextColumn("Airline", width="medium"),
-            "Flight #": st.column_config.TextColumn("Flight #", width="small"),
-            "From": st.column_config.TextColumn(
-                "From",
-                help="Airport code + city, e.g. JFK New York",
-                width="medium",
-            ),
-            "Dep. Country": st.column_config.TextColumn(
-                "Dep. Country",
-                help="2-letter ISO code, e.g. US",
-                width="small",
-            ),
-            "To": st.column_config.TextColumn(
-                "To",
-                help="Airport code + city, e.g. LHR London",
-                width="medium",
-            ),
-            "Arr. Country": st.column_config.TextColumn(
-                "Arr. Country",
-                help="2-letter ISO code, e.g. GB",
-                width="small",
-            ),
-            "Arr. Date": st.column_config.TextColumn(
-                "Arr. Date",
-                help="YYYY-MM-DD (optional)",
-                width="small",
-            ),
-            "Booking Ref": st.column_config.TextColumn("Booking Ref", width="small"),
-        },
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
-        key="flight_review_editor",
+        f"""
+        <div class="review-card">
+          <div class="route-header">
+            <div>
+              <div class="route-airport">{dep_code}</div>
+              <div class="route-city">{dep_city}</div>
+            </div>
+            <div class="route-arrow">→</div>
+            <div>
+              <div class="route-airport">{arr_code}</div>
+              <div class="route-city">{arr_city}</div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    # ── Live metrics from edited state ───────────────────────────────────────
-    included_mask = edited["✓ Include"].fillna(False).astype(bool)
-    included_rows = edited[included_mask]
-    n_total    = len(edited)
-    n_included = len(included_rows)
-    n_excluded = n_total - n_included
+    # ── Flight details ───────────────────────────────────────────────────────
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("📅 Date",        f.get("departure_date")    or "—")
+    d2.metric("✈️ Airline",     f.get("airline")           or "—")
+    d3.metric("🔢 Flight #",    f.get("flight_number")     or "—")
+    d4.metric("📋 Booking Ref", f.get("booking_reference") or "—")
 
+    # ── View source email ────────────────────────────────────────────────────
     st.write("")
-    mc1, mc2, mc3 = st.columns(3)
-    mc1.metric("✈️ Total detected", n_total)
-    mc2.metric("✅ Included",        n_included)
-    mc3.metric("❌ Excluded",        n_excluded)
+    has_source = bool(f.get("_source_body"))
+    if has_source:
+        if st.button("📧 View source email", use_container_width=False):
+            _email_viewer(
+                subject=f.get("_source_subject", ""),
+                sender =f.get("_source_sender",  ""),
+                date   =f.get("_source_date",    ""),
+                body   =f.get("_source_body",    ""),
+            )
+    else:
+        st.caption("_(no source email captured for this flight)_")
 
-    if n_included == 0:
-        st.warning("No flights are currently included. Check at least one row to enable export.", icon="⚠️")
-        return
-
-    # ── Compliance — recalculates live from included rows ────────────────────
-    included_flights = [_editor_row_to_flight(row) for _, row in included_rows.iterrows()]
-    compliance  = comp_lib.check_compliance(included_flights, country)
-    css = {"ok": "comp-ok", "warning": "comp-warning", "over": "comp-over"}[compliance.status]
-
+    # ── Keep / Ignore / Back ─────────────────────────────────────────────────
     st.write("")
-    st.markdown(f'<div class="{css}">{compliance.message}</div>', unsafe_allow_html=True)
-    st.write("")
+    col_back, col_ignore, col_keep = st.columns([1, 2, 2])
 
-    if compliance.yearly_breakdown:
-        with st.expander("📆 Year-by-year breakdown"):
-            method     = country.get("calculation_method", "per_year")
-            max_per_yr = country.get("max_days_abroad_per_year") if method == "per_year" else None
-            year_df = pd.DataFrame([
-                {
-                    "Year":             yr,
-                    "Est. Days Abroad": days,
-                    "Status":           "⚠️ Over limit" if max_per_yr and days > max_per_yr else "✅ OK",
-                }
-                for yr, days in sorted(compliance.yearly_breakdown.items())
-            ])
-            st.dataframe(year_df, use_container_width=True, hide_index=True)
+    with col_back:
+        back_disabled = idx == 0
+        if st.button("← Back", use_container_width=True, disabled=back_disabled):
+            if decisions:
+                decisions.pop()
+                st.session_state["flight_decisions"] = decisions
+            st.session_state["review_index"] = idx - 1
+            st.rerun()
 
-    # ── Export ───────────────────────────────────────────────────────────────
+    with col_ignore:
+        if st.button("❌  Ignore", use_container_width=True):
+            decisions.append("ignore")
+            st.session_state["flight_decisions"] = decisions
+            st.session_state["review_index"]     = idx + 1
+            st.rerun()
+
+    with col_keep:
+        if st.button("✅  Keep", use_container_width=True, type="primary"):
+            decisions.append("keep")
+            st.session_state["flight_decisions"] = decisions
+            st.session_state["review_index"]     = idx + 1
+            st.rerun()
+
+    # Remaining count reminder
+    remaining = total - idx - 1
+    if remaining > 0:
+        st.caption(f"{remaining} flight{'s' if remaining != 1 else ''} remaining to review")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FINAL RESULTS — after all flights are reviewed
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_final_results(
+    flights: list[dict],
+    decisions: list[str],
+    country: dict,
+):
+    kept    = [f for f, d in zip(flights, decisions) if d == "keep"]
+    ignored = [f for f, d in zip(flights, decisions) if d == "ignore"]
+
+    st.subheader(f"📊 Results — {country.get('flag','')} {country['name']}")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("✈️ Detected",  len(flights))
+    m2.metric("✅ Kept",       len(kept))
+    m3.metric("❌ Ignored",    len(ignored))
+
+    if not kept:
+        st.warning(
+            "No flights were kept. Use **Re-review** below to go back through them.",
+            icon="⚠️",
+        )
+    else:
+        # Compliance based only on kept flights
+        compliance = comp_lib.check_compliance(kept, country)
+        css = {"ok": "comp-ok", "warning": "comp-warning", "over": "comp-over"}[compliance.status]
+        st.write("")
+        st.markdown(f'<div class="{css}">{compliance.message}</div>', unsafe_allow_html=True)
+        st.write("")
+
+        if compliance.yearly_breakdown:
+            with st.expander("📆 Year-by-year breakdown"):
+                method     = country.get("calculation_method", "per_year")
+                max_per_yr = country.get("max_days_abroad_per_year") if method == "per_year" else None
+                year_df = pd.DataFrame([
+                    {
+                        "Year":             yr,
+                        "Est. Days Abroad": days,
+                        "Status":           "⚠️ Over limit" if max_per_yr and days > max_per_yr else "✅ OK",
+                    }
+                    for yr, days in sorted(compliance.yearly_breakdown.items())
+                ])
+                st.dataframe(year_df, use_container_width=True, hide_index=True)
+
+        # Flight summary table (read-only)
+        st.subheader(f"Kept flights ({len(kept)})")
+        _SOURCE_KEYS = {"_source_subject", "_source_sender", "_source_date", "_source_body"}
+        summary_df = pd.DataFrame([
+            {k: v for k, v in f.items() if k not in _SOURCE_KEYS}
+            for f in kept
+        ])
+        # Rename for display
+        summary_df = summary_df.rename(columns={
+            "departure_date":    "Dep. Date",
+            "airline":           "Airline",
+            "flight_number":     "Flight #",
+            "departure_airport": "Dep. Airport",
+            "departure_city":    "Dep. City",
+            "departure_country": "Dep. Country",
+            "arrival_airport":   "Arr. Airport",
+            "arrival_city":      "Arr. City",
+            "arrival_country":   "Arr. Country",
+            "arrival_date":      "Arr. Date",
+            "booking_reference": "Booking Ref",
+        })
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+        # CSV export
+        st.divider()
+        country_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", country["name"])
+        today        = datetime.now().strftime("%Y-%m-%d")
+        st.download_button(
+            label=f"⬇️ Download CSV — {len(kept)} flight{'s' if len(kept) != 1 else ''}",
+            data=summary_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{country_slug}_flight_history_{today}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            type="primary",
+        )
+
+        st.caption(
+            "⚠️ **Disclaimer:** This tool is an aid for organising flight records only. "
+            "Always verify against official airline records and consult a qualified "
+            "immigration attorney before submitting to any government authority."
+        )
+
     st.divider()
-    export_df    = included_rows.drop(columns=["✓ Include"])
-    country_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", country["name"])
-    today        = datetime.now().strftime("%Y-%m-%d")
-
-    st.download_button(
-        label=f"⬇️ Export {n_included} reviewed flight{'s' if n_included != 1 else ''} to CSV",
-        data=export_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{country_slug}_flight_history_{today}.csv",
-        mime="text/csv",
-        use_container_width=True,
-        type="primary",
-    )
-
-    st.caption(
-        "⚠️ **Disclaimer:** This tool is an aid for organising flight records only. "
-        "Always verify against official airline records and consult a qualified "
-        "immigration attorney before submitting to any government authority."
-    )
+    if st.button("🔄 Re-review all flights", use_container_width=True):
+        st.session_state["review_index"]     = 0
+        st.session_state["flight_decisions"] = []
+        st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

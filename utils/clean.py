@@ -123,6 +123,9 @@ _FIELDS = [
 ]
 
 
+_SOURCE_FIELDS = ("_source_subject", "_source_sender", "_source_date", "_source_body")
+
+
 def _merge_group(records: list[dict]) -> dict:
     """Merge a group of duplicate records into one, maximising completeness.
 
@@ -130,6 +133,8 @@ def _merge_group(records: list[dict]) -> dict:
       - Take the first non-null value across all records in the group.
       - For flight_number and booking_reference, prefer the normalised
         (no-space) form if multiple variants exist.
+      - Source-email metadata (_source_*) is carried from the first record
+        that has it so the review UI can still show the original email.
     """
     if len(records) == 1:
         return records[0]
@@ -142,7 +147,6 @@ def _merge_group(records: list[dict]) -> dict:
             continue
 
         if field == "flight_number":
-            # Prefer the normalised form (no spaces)
             normed = [_norm_flight_num(v) for v in values if _norm_flight_num(v)]
             merged[field] = normed[0] if normed else values[0]
         elif field == "booking_reference":
@@ -150,6 +154,10 @@ def _merge_group(records: list[dict]) -> dict:
             merged[field] = normed[0] if normed else values[0]
         else:
             merged[field] = values[0]
+
+    # Carry source-email metadata from the first record that has it
+    for key in _SOURCE_FIELDS:
+        merged[key] = next((r[key] for r in records if r.get(key)), None)
 
     return merged
 
